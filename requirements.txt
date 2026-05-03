@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+huggingface_hub
+python-dotenv
+gTTS
+pillow
+openai
+numpy
+requests
+moviepy
+imageio
+imageio-ffmpeg
