@@ -71,6 +71,13 @@ def get_url(request: Request, file):
 def home():
     return {"message": "API Running 🚀"}
 
+@app.get("/check-env")
+def check_env():
+    return {
+        "hf_token_loaded": bool(os.getenv("HF_TOKEN")),
+        "server_base_url": os.getenv("SERVER_BASE_URL")
+    }
+
 
 # ================= CONTENT =================
 @app.post("/generate-content")
