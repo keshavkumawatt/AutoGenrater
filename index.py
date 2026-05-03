@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,21 +12,18 @@ import os
 import uuid
 import requests
 from urllib.parse import quote_plus
-
-from moviepy import (
-    VideoClip,
-    AudioFileClip,
-    CompositeVideoClip,
-)
+from moviepy import VideoClip, AudioFileClip, CompositeVideoClip
 
 load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
 
-app = FastAPI(title="AI Chatbot + Image + Video Generator")
+HF_TOKEN = os.getenv("HF_TOKEN")
+BASE_URL = os.getenv("SERVER_BASE_URL", "")
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,264 +47,136 @@ class VideoRequest(BaseModel):
     duration: int = 10
 
 
-image_client = InferenceClient(provider="wavespeed", api_key=HF_TOKEN)
+# ✅ SAFE CLIENT INIT
+image_client = None
+text_client = None
 
-text_client = OpenAI(
-    base_url="https://router.huggingface.co/v1",
-    api_key=HF_TOKEN,
-)
-
-
-def _fetch_ai_image(prompt: str, save_path: str) -> bool:
-    try:
-        image = image_client.text_to_image(
-            prompt,
-            model="black-forest-labs/FLUX.1-dev"
-        )
-        image.save(save_path)
-        return True
-    except Exception:
-        pass
-
-    try:
-        encoded = quote_plus(prompt)
-        response = requests.get(
-            f"https://image.pollinations.ai/prompt/{encoded}",
-            timeout=60
-        )
-
-        if response.status_code == 200:
-            with open(save_path, "wb") as f:
-                f.write(response.content)
-            return True
-    except Exception:
-        pass
-
-    return False
+if HF_TOKEN:
+    image_client = InferenceClient(provider="wavespeed", api_key=HF_TOKEN)
+    text_client = OpenAI(
+        base_url="https://router.huggingface.co/v1",
+        api_key=HF_TOKEN,
+    )
+else:
+    print("HF_TOKEN missing")
 
 
-def _make_animated_clip(image_path: str, duration: float) -> VideoClip:
-    W, H = 1280, 720
-    FPS = 24
-
-    pil_img = Image.open(image_path).convert("RGB").resize((W, H), Image.LANCZOS)
-
-    CANVAS_W, CANVAS_H = int(W * 1.25), int(H * 1.25)
-    pil_large = pil_img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
-    large_arr = np.array(pil_large)
-
-    vignette = Image.new("L", (W, H), 0)
-    draw = ImageDraw.Draw(vignette)
-
-    for i in range(min(W, H) // 2):
-        alpha = int(255 * (i / (min(W, H) / 2)) ** 0.7)
-        draw.ellipse([i, i, W - i, H - i], outline=alpha)
-
-    vignette_arr = np.array(vignette) / 255.0
-
-    def make_frame(t):
-        progress = min(t / duration, 1)
-
-        scale = 1.0 + 0.15 * progress
-
-        crop_w = int(W / scale)
-        crop_h = int(H / scale)
-
-        x_offset = int((CANVAS_W - crop_w) * (0.35 + 0.12 * progress))
-        y_offset = int((CANVAS_H - crop_h) * (0.45 + 0.04 * np.sin(progress * np.pi)))
-
-        x_offset = max(0, min(x_offset, CANVAS_W - crop_w))
-        y_offset = max(0, min(y_offset, CANVAS_H - crop_h))
-
-        cropped = large_arr[
-            y_offset:y_offset + crop_h,
-            x_offset:x_offset + crop_w
-        ]
-
-        frame_pil = Image.fromarray(cropped).resize((W, H), Image.LANCZOS)
-
-        brightness = 1.0 + 0.05 * np.sin(2 * np.pi * t / max(duration, 1))
-        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
-
-        frame = np.array(frame_pil).astype(np.float64)
-
-        for c in range(3):
-            frame[:, :, c] = frame[:, :, c] * (0.65 + 0.35 * vignette_arr)
-
-        if t < 1.2:
-            fade = t / 1.2
-            frame = frame * fade
-
-        return frame.clip(0, 255).astype(np.uint8)
-
-    clip = VideoClip(make_frame, duration=duration)
-    clip = clip.with_fps(FPS)
-
-    return clip
+def get_url(request: Request, file):
+    if BASE_URL:
+        return f"{BASE_URL}/outputs/{file}"
+    return f"{request.base_url}outputs/{file}"
 
 
 @app.get("/")
 def home():
-    return {
-        "message": "AI Chatbot + Image + Video API Running",
-        "swagger": "http://127.0.0.1:8000/docs"
-    }
+    return {"message": "API Running 🚀"}
 
 
+# ================= CONTENT =================
 @app.post("/generate-content")
-def generate_content(request: ContentRequest):
+def generate_content(req: ContentRequest):
     try:
-        user_message = request.message.strip()
+        if not text_client:
+            return {"success": False, "error": "HF_TOKEN missing"}
 
-        if not user_message:
-            return {"success": False, "error": "Message is required"}
-
-        completion = text_client.chat.completions.create(
+        res = text_client.chat.completions.create(
             model="moonshotai/Kimi-K2-Instruct-0905",
             messages=[
-                {
-                    "role": "system",
-                    "content": """
-You are a smart AI chatbot and content generator.
-
-Rules:
-- Always reply in English
-- Give dynamic responses based on user input
-- If user asks for a story, give a story
-- If user asks for caption, give caption
-- If user asks for script, give script
-- If user chats normally, reply like a chatbot
-- Keep answers clear, useful, and engaging
-"""
-                },
-                {
-                    "role": "user",
-                    "content": user_message
-                }
+                {"role": "user", "content": req.message}
             ],
         )
 
         return {
             "success": True,
-            "message": user_message,
-            "reply": completion.choices[0].message.content
+            "reply": res.choices[0].message.content
         }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
+# ================= IMAGE =================
 @app.post("/generate-image")
-def generate_image(request: ImageRequest):
+def generate_image(req: ImageRequest, request: Request):
     try:
-        prompt = request.prompt.strip()
+        file = f"{uuid.uuid4()}.png"
+        path = os.path.join(OUTPUT_DIR, file)
 
-        if not prompt:
-            return {"success": False, "error": "Prompt is required"}
+        if image_client:
+            try:
+                img = image_client.text_to_image(
+                    req.prompt,
+                    model="black-forest-labs/FLUX.1-dev"
+                )
+                img.save(path)
 
-        file_name = f"{uuid.uuid4()}.png"
-        path = os.path.join(OUTPUT_DIR, file_name)
+                return {
+                    "success": True,
+                    "url": get_url(request, file)
+                }
+            except:
+                pass
 
-        try:
-            image = image_client.text_to_image(
-                prompt,
-                model="black-forest-labs/FLUX.1-dev"
-            )
-            image.save(path)
-
-            return {
-                "success": True,
-                "source": "huggingface",
-                "file": file_name,
-                "url": f"http://127.0.0.1:8000/outputs/{file_name}"
-            }
-
-        except Exception:
-            pass
-
-        encoded = quote_plus(prompt)
-        response = requests.get(
-            f"https://image.pollinations.ai/prompt/{encoded}",
-            timeout=60
-        )
-
-        if response.status_code != 200:
-            return {
-                "success": False,
-                "error": "Image generation failed"
-            }
+        # fallback
+        encoded = quote_plus(req.prompt)
+        r = requests.get(f"https://image.pollinations.ai/prompt/{encoded}")
 
         with open(path, "wb") as f:
-            f.write(response.content)
+            f.write(r.content)
 
         return {
             "success": True,
-            "source": "pollinations",
-            "file": file_name,
-            "url": f"http://127.0.0.1:8000/outputs/{file_name}"
+            "url": get_url(request, file)
         }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
+# ================= VIDEO =================
 @app.post("/generate-video")
-def generate_video(request: VideoRequest):
+def generate_video(req: VideoRequest, request: Request):
     try:
-        prompt = request.prompt.strip()
+        uid = str(uuid.uuid4())
 
-        if not prompt:
-            return {"success": False, "error": "Prompt is required"}
+        img_path = f"{OUTPUT_DIR}/{uid}.png"
+        audio_path = f"{OUTPUT_DIR}/{uid}.mp3"
+        video_path = f"{OUTPUT_DIR}/{uid}.mp4"
 
-        uid = uuid.uuid4()
+        # image
+        ok = False
+        if image_client:
+            try:
+                img = image_client.text_to_image(req.prompt)
+                img.save(img_path)
+                ok = True
+            except:
+                pass
 
-        image_path = os.path.join(OUTPUT_DIR, f"{uid}_image.png")
-        audio_path = os.path.join(OUTPUT_DIR, f"{uid}_audio.mp3")
-        video_path = os.path.join(OUTPUT_DIR, f"{uid}_video.mp4")
+        if not ok:
+            encoded = quote_plus(req.prompt)
+            r = requests.get(f"https://image.pollinations.ai/prompt/{encoded}")
+            with open(img_path, "wb") as f:
+                f.write(r.content)
 
-        image_ok = _fetch_ai_image(prompt, image_path)
-
-        if not image_ok:
-            return {
-                "success": False,
-                "error": "Image generation failed. Video cannot be created."
-            }
-
-        tts = gTTS(text=prompt, lang="en")
+        # audio
+        tts = gTTS(req.prompt)
         tts.save(audio_path)
 
-        audio_clip = AudioFileClip(audio_path)
+        audio = AudioFileClip(audio_path)
 
-        video_duration = request.duration
+        def make_frame(t):
+            img = Image.open(img_path).resize((1280, 720))
+            return np.array(img)
 
-        if video_duration < 3:
-            video_duration = 3
+        clip = VideoClip(make_frame, duration=req.duration)
+        clip = clip.set_audio(audio)
 
-        animated_clip = _make_animated_clip(image_path, video_duration)
-
-        final_clip = CompositeVideoClip([animated_clip])
-        final_clip = final_clip.with_audio(audio_clip)
-
-        final_clip.write_videofile(
-            video_path,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            logger=None
-        )
-
-        audio_clip.close()
-        animated_clip.close()
-        final_clip.close()
-
-        video_name = os.path.basename(video_path)
-        image_name = os.path.basename(image_path)
+        clip.write_videofile(video_path, fps=24)
 
         return {
             "success": True,
-            "file": video_name,
-            "url": f"http://127.0.0.1:8000/outputs/{video_name}",
-            "preview_image_url": f"http://127.0.0.1:8000/outputs/{image_name}"
+            "url": get_url(request, os.path.basename(video_path))
         }
 
     except Exception as e:
