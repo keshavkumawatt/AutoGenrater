@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,18 +13,20 @@ import uuid
 import requests
 from urllib.parse import quote_plus
 
-from moviepy import VideoClip, AudioFileClip, CompositeVideoClip
+from moviepy import (
+    VideoClip,
+    AudioFileClip,
+    CompositeVideoClip,
+)
 
 load_dotenv()
-
 HF_TOKEN = os.getenv("HF_TOKEN")
-SERVER_BASE_URL = os.getenv("SERVER_BASE_URL")
 
 app = FastAPI(title="AI Chatbot + Image + Video Generator")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,37 +50,24 @@ class VideoRequest(BaseModel):
     duration: int = 10
 
 
-image_client = None
-text_client = None
+image_client = InferenceClient(provider="wavespeed", api_key=HF_TOKEN)
 
-if HF_TOKEN:
-    image_client = InferenceClient(provider="wavespeed", api_key=HF_TOKEN)
-
-    text_client = OpenAI(
-        base_url="https://router.huggingface.co/v1",
-        api_key=HF_TOKEN,
-    )
-else:
-    print("WARNING: HF_TOKEN is missing. Add HF_TOKEN in Render Environment Variables.")
-
-
-def get_base_url(request: Request):
-    if SERVER_BASE_URL:
-        return SERVER_BASE_URL.rstrip("/")
-    return str(request.base_url).rstrip("/")
+text_client = OpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=HF_TOKEN,
+)
 
 
 def _fetch_ai_image(prompt: str, save_path: str) -> bool:
-    if image_client:
-        try:
-            image = image_client.text_to_image(
-                prompt,
-                model="black-forest-labs/FLUX.1-dev"
-            )
-            image.save(save_path)
-            return True
-        except Exception as e:
-            print("HuggingFace image failed:", str(e))
+    try:
+        image = image_client.text_to_image(
+            prompt,
+            model="black-forest-labs/FLUX.1-dev"
+        )
+        image.save(save_path)
+        return True
+    except Exception:
+        pass
 
     try:
         encoded = quote_plus(prompt)
@@ -91,9 +80,8 @@ def _fetch_ai_image(prompt: str, save_path: str) -> bool:
             with open(save_path, "wb") as f:
                 f.write(response.content)
             return True
-
-    except Exception as e:
-        print("Pollinations image failed:", str(e))
+    except Exception:
+        pass
 
     return False
 
@@ -159,26 +147,17 @@ def _make_animated_clip(image_path: str, duration: float) -> VideoClip:
 
 
 @app.get("/")
-def home(request: Request):
-    base_url = get_base_url(request)
-
+def home():
     return {
-        "success": True,
         "message": "AI Chatbot + Image + Video API Running",
-        "docs": f"{base_url}/docs"
+        "swagger": "http://127.0.0.1:8000/docs"
     }
 
 
 @app.post("/generate-content")
-def generate_content(request_data: ContentRequest):
+def generate_content(request: ContentRequest):
     try:
-        if not text_client:
-            return {
-                "success": False,
-                "error": "HF_TOKEN is missing. Add HF_TOKEN in Render Environment Variables."
-            }
-
-        user_message = request_data.message.strip()
+        user_message = request.message.strip()
 
         if not user_message:
             return {"success": False, "error": "Message is required"}
@@ -219,11 +198,9 @@ Rules:
 
 
 @app.post("/generate-image")
-def generate_image(request_data: ImageRequest, request: Request):
+def generate_image(request: ImageRequest):
     try:
-        base_url = get_base_url(request)
-
-        prompt = request_data.prompt.strip()
+        prompt = request.prompt.strip()
 
         if not prompt:
             return {"success": False, "error": "Prompt is required"}
@@ -231,23 +208,22 @@ def generate_image(request_data: ImageRequest, request: Request):
         file_name = f"{uuid.uuid4()}.png"
         path = os.path.join(OUTPUT_DIR, file_name)
 
-        if image_client:
-            try:
-                image = image_client.text_to_image(
-                    prompt,
-                    model="black-forest-labs/FLUX.1-dev"
-                )
-                image.save(path)
+        try:
+            image = image_client.text_to_image(
+                prompt,
+                model="black-forest-labs/FLUX.1-dev"
+            )
+            image.save(path)
 
-                return {
-                    "success": True,
-                    "source": "huggingface",
-                    "file": file_name,
-                    "url": f"{base_url}/outputs/{file_name}"
-                }
+            return {
+                "success": True,
+                "source": "huggingface",
+                "file": file_name,
+                "url": f"http://127.0.0.1:8000/outputs/{file_name}"
+            }
 
-            except Exception as e:
-                print("HuggingFace image failed:", str(e))
+        except Exception:
+            pass
 
         encoded = quote_plus(prompt)
         response = requests.get(
@@ -268,7 +244,7 @@ def generate_image(request_data: ImageRequest, request: Request):
             "success": True,
             "source": "pollinations",
             "file": file_name,
-            "url": f"{base_url}/outputs/{file_name}"
+            "url": f"http://127.0.0.1:8000/outputs/{file_name}"
         }
 
     except Exception as e:
@@ -276,11 +252,9 @@ def generate_image(request_data: ImageRequest, request: Request):
 
 
 @app.post("/generate-video")
-def generate_video(request_data: VideoRequest, request: Request):
+def generate_video(request: VideoRequest):
     try:
-        base_url = get_base_url(request)
-
-        prompt = request_data.prompt.strip()
+        prompt = request.prompt.strip()
 
         if not prompt:
             return {"success": False, "error": "Prompt is required"}
@@ -304,7 +278,7 @@ def generate_video(request_data: VideoRequest, request: Request):
 
         audio_clip = AudioFileClip(audio_path)
 
-        video_duration = request_data.duration
+        video_duration = request.duration
 
         if video_duration < 3:
             video_duration = 3
@@ -332,8 +306,8 @@ def generate_video(request_data: VideoRequest, request: Request):
         return {
             "success": True,
             "file": video_name,
-            "url": f"{base_url}/outputs/{video_name}",
-            "preview_image_url": f"{base_url}/outputs/{image_name}"
+            "url": f"http://127.0.0.1:8000/outputs/{video_name}",
+            "preview_image_url": f"http://127.0.0.1:8000/outputs/{image_name}"
         }
 
     except Exception as e:
