@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageEnhance
+from PIL import Image
 from openai import OpenAI
 import numpy as np
 import os
@@ -17,9 +17,9 @@ from moviepy import VideoClip, AudioFileClip, CompositeVideoClip
 load_dotenv()
 
 HF_TOKEN = os.getenv("HF_TOKEN")
-BASE_URL = os.getenv("SERVER_BASE_URL", "")
+SERVER_BASE_URL = os.getenv("SERVER_BASE_URL", "")
 
-app = FastAPI()
+app = FastAPI(title="AI Chatbot + Image + Video Generator")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +47,6 @@ class VideoRequest(BaseModel):
     duration: int = 10
 
 
-# ✅ SAFE CLIENT INIT
 image_client = None
 text_client = None
 
@@ -57,134 +56,240 @@ if HF_TOKEN:
         base_url="https://router.huggingface.co/v1",
         api_key=HF_TOKEN,
     )
-else:
-    print("HF_TOKEN missing")
 
 
-def get_url(request: Request, file):
-    if BASE_URL:
-        return f"{BASE_URL}/outputs/{file}"
-    return f"{request.base_url}outputs/{file}"
+def get_file_url(request: Request, filename: str):
+    if SERVER_BASE_URL:
+        return f"{SERVER_BASE_URL.rstrip('/')}/outputs/{filename}"
+    return f"{str(request.base_url).rstrip('/')}/outputs/{filename}"
+
+
+def fallback_content(message: str):
+    return f"""
+Here is a simple content idea based on your message: "{message}"
+
+Title: A Student's Journey
+
+Once there was a student who wanted to become successful but faced many challenges. Every day, the student worked hard, learned from mistakes, and kept moving forward. Slowly, confidence started growing. The student understood that success does not come in one day, but daily effort can change everything.
+
+Moral: Hard work, patience, and consistency can turn dreams into reality.
+"""
 
 
 @app.get("/")
-def home():
-    return {"message": "API Running 🚀"}
-
-@app.get("/check-env")
-def check_env():
+def home(request: Request):
     return {
-        "hf_token_loaded": bool(os.getenv("HF_TOKEN")),
-        "server_base_url": os.getenv("SERVER_BASE_URL")
+        "success": True,
+        "message": "AI Chatbot + Image + Video API Running",
+        "docs": f"{str(request.base_url).rstrip('/')}/docs"
     }
 
 
-# ================= CONTENT =================
 @app.post("/generate-content")
 def generate_content(req: ContentRequest):
     try:
-        if not text_client:
-            return {"success": False, "error": "HF_TOKEN missing"}
+        user_message = req.message.strip()
 
-        res = text_client.chat.completions.create(
+        if not user_message:
+            return {"success": False, "error": "Message is required"}
+
+        if not text_client:
+            return {
+                "success": True,
+                "source": "fallback",
+                "message": user_message,
+                "reply": fallback_content(user_message)
+            }
+
+        completion = text_client.chat.completions.create(
             model="moonshotai/Kimi-K2-Instruct-0905",
             messages=[
-                {"role": "user", "content": req.message}
+                {
+                    "role": "system",
+                    "content": "You are a smart AI chatbot and content generator. Always reply in English."
+                },
+                {
+                    "role": "user",
+                    "content": user_message
+                }
             ],
         )
 
         return {
             "success": True,
-            "reply": res.choices[0].message.content
+            "source": "huggingface",
+            "message": user_message,
+            "reply": completion.choices[0].message.content
         }
 
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": True,
+            "source": "fallback",
+            "message": req.message,
+            "reply": fallback_content(req.message),
+            "warning": str(e)
+        }
 
 
-# ================= IMAGE =================
 @app.post("/generate-image")
 def generate_image(req: ImageRequest, request: Request):
     try:
-        file = f"{uuid.uuid4()}.png"
-        path = os.path.join(OUTPUT_DIR, file)
+        prompt = req.prompt.strip()
+
+        if not prompt:
+            return {"success": False, "error": "Prompt is required"}
+
+        file_name = f"{uuid.uuid4()}.png"
+        path = os.path.join(OUTPUT_DIR, file_name)
 
         if image_client:
             try:
-                img = image_client.text_to_image(
-                    req.prompt,
+                image = image_client.text_to_image(
+                    prompt,
                     model="black-forest-labs/FLUX.1-dev"
                 )
-                img.save(path)
+                image.save(path)
 
                 return {
                     "success": True,
-                    "url": get_url(request, file)
+                    "source": "huggingface",
+                    "file": file_name,
+                    "url": get_file_url(request, file_name)
                 }
-            except:
+
+            except Exception:
                 pass
 
-        # fallback
-        encoded = quote_plus(req.prompt)
-        r = requests.get(f"https://image.pollinations.ai/prompt/{encoded}")
+        encoded = quote_plus(prompt)
+        response = requests.get(
+            f"https://image.pollinations.ai/prompt/{encoded}",
+            timeout=60
+        )
+
+        if response.status_code != 200:
+            return {"success": False, "error": "Image generation failed"}
 
         with open(path, "wb") as f:
-            f.write(r.content)
+            f.write(response.content)
 
         return {
             "success": True,
-            "url": get_url(request, file)
+            "source": "pollinations",
+            "file": file_name,
+            "url": get_file_url(request, file_name)
         }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-# ================= VIDEO =================
+def fetch_image_for_video(prompt: str, image_path: str):
+    if image_client:
+        try:
+            image = image_client.text_to_image(
+                prompt,
+                model="black-forest-labs/FLUX.1-dev"
+            )
+            image.save(image_path)
+            return True
+        except Exception:
+            pass
+
+    try:
+        encoded = quote_plus(prompt)
+        response = requests.get(
+            f"https://image.pollinations.ai/prompt/{encoded}",
+            timeout=60
+        )
+
+        if response.status_code == 200:
+            with open(image_path, "wb") as f:
+                f.write(response.content)
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
 @app.post("/generate-video")
 def generate_video(req: VideoRequest, request: Request):
+    audio_clip = None
+    video_clip = None
+    final_clip = None
+
     try:
+        prompt = req.prompt.strip()
+
+        if not prompt:
+            return {"success": False, "error": "Prompt is required"}
+
+        duration = req.duration
+        if duration < 3:
+            duration = 3
+        if duration > 15:
+            duration = 15
+
         uid = str(uuid.uuid4())
 
-        img_path = f"{OUTPUT_DIR}/{uid}.png"
-        audio_path = f"{OUTPUT_DIR}/{uid}.mp3"
-        video_path = f"{OUTPUT_DIR}/{uid}.mp4"
+        image_path = os.path.join(OUTPUT_DIR, f"{uid}_image.png")
+        audio_path = os.path.join(OUTPUT_DIR, f"{uid}_audio.mp3")
+        video_path = os.path.join(OUTPUT_DIR, f"{uid}_video.mp4")
 
-        # image
-        ok = False
-        if image_client:
-            try:
-                img = image_client.text_to_image(req.prompt)
-                img.save(img_path)
-                ok = True
-            except:
-                pass
+        image_ok = fetch_image_for_video(prompt, image_path)
 
-        if not ok:
-            encoded = quote_plus(req.prompt)
-            r = requests.get(f"https://image.pollinations.ai/prompt/{encoded}")
-            with open(img_path, "wb") as f:
-                f.write(r.content)
+        if not image_ok:
+            return {
+                "success": False,
+                "error": "Image generation failed. Video cannot be created."
+            }
 
-        # audio
-        tts = gTTS(req.prompt)
+        tts = gTTS(text=prompt, lang="en")
         tts.save(audio_path)
 
-        audio = AudioFileClip(audio_path)
+        audio_clip = AudioFileClip(audio_path)
+
+        base_img = Image.open(image_path).convert("RGB").resize((1280, 720))
+        base_array = np.array(base_img)
 
         def make_frame(t):
-            img = Image.open(img_path).resize((1280, 720))
-            return np.array(img)
+            return base_array
 
-        clip = VideoClip(make_frame, duration=req.duration)
-        clip = clip.set_audio(audio)
+        video_clip = VideoClip(make_frame, duration=duration).with_fps(24)
 
-        clip.write_videofile(video_path, fps=24)
+        # ✅ MoviePy v2 fix: set_audio ❌, with_audio ✅
+        final_clip = CompositeVideoClip([video_clip]).with_audio(audio_clip)
+
+        final_clip.write_videofile(
+            video_path,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            logger=None
+        )
+
+        video_name = os.path.basename(video_path)
+        image_name = os.path.basename(image_path)
 
         return {
             "success": True,
-            "url": get_url(request, os.path.basename(video_path))
+            "file": video_name,
+            "url": get_file_url(request, video_name),
+            "preview_image_url": get_file_url(request, image_name)
         }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+    finally:
+        try:
+            if audio_clip:
+                audio_clip.close()
+            if video_clip:
+                video_clip.close()
+            if final_clip:
+                final_clip.close()
+        except Exception:
+            pass
